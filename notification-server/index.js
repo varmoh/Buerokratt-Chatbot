@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { client } = require('./src/openSearch');
+const logger = require('./src/logger');  // Import the logger
 
 (async () => {
   try {
@@ -10,8 +11,10 @@ const { client } = require('./src/openSearch');
       },
     });
 
+    logger.info('OpenSearch index settings updated successfully.');
+
     require('./src/server');
   } catch (error) {
-    console.error('Error:', error);
+    logger.error('Error updating OpenSearch index settings:', error);
   }
 })();
