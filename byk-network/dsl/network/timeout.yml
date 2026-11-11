@@ -1,0 +1,112 @@
+# Bürokrati võrgustik (demo), BYK A: valikuline ajapiir. notifications-node kutsub seda
+# answerTimeoutS sekundit pärast küsimuse saatmist (/network/timer). Kui B pole vastanud,
+# saab kasutaja teate ja hilinenud vastus jäetakse kõrvale.
+declaration:
+  call: declare
+  version: 0.1
+  description: "Buerokratt network (demo): answer timeout"
+  method: post
+  accepts: json
+  returns: json
+  namespace: backoffice
+  allowlist:
+    body:
+      - field: chatId
+        type: string
+        description: "Chat id"
+      - field: requestId
+        type: string
+        description: "Network request id"
+
+assign_input:
+  assign:
+    chatId: ${incoming.body.chatId ?? ''}
+    requestId: ${incoming.body.requestId ?? ''}
+
+get_config:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "network_config"
+  error: return_ok
+  result: config_res
+
+get_chat_messages:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-chat-messages"
+    body:
+      chatId: ${chatId}
+  error: return_ok
+  result: messages_res
+
+assign_state:
+  assign:
+    cfg: "$=JSON.parse(config_res.response.body[0]?.value ?? '{}')="
+  next: check_pending
+
+check_pending:
+  switch:
+    - condition: ${requestId !== '' && messages_res.response.body.some(m => m.forwardedByUser === 'nw:' + requestId) && !messages_res.response.body.some(m => m.forwardedByUser === 'nw-ans:' + requestId)}
+      next: get_request
+  next: return_ok
+
+get_request:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: ${'network_req:' + requestId}
+  error: return_ok
+  result: request_res
+
+assign_target:
+  assign:
+    targetName: "$=JSON.parse(request_res.response.body[0]?.value ?? '{}').targetName ?? 'teine asutus'="
+  next: insert_timeout
+
+# Marker nw-ans:<id>: hilinenud vastus jäetakse kõrvale (network/incoming check_pending)
+insert_timeout:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${chatId}
+      messageId: ${requestId.slice(0, 24) + 'dddddddddddd'}
+      content: ${(cfg.texts?.timeout ?? 'Kahjuks ei vastanud %ASUTUS% õigeks ajaks.').split('%ASUTUS%').join(targetName)}
+      authorTimestamp: ${new Date().toISOString()}
+      authorId: ""
+      authorFirstName: ""
+      authorRole: "buerokratt"
+      created: ${new Date().toISOString()}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: ${'nw-ans:' + requestId}
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  error: return_ok
+  result: timeout_res
+
+notify_chats:
+  template: "[#CHATBOT_PROJECT_LAYER]/chats/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+  result: notify_chats_res
+
+notify_messages:
+  template: "[#CHATBOT_PROJECT_LAYER]/messages/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+    type: "message"
+    messageId: ""
+  result: notify_messages_res
+
+return_ok:
+  status: 200
+  return: "OK"
+  next: end

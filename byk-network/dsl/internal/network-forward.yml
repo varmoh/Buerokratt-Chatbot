@@ -1,0 +1,207 @@
+# Bürokrati võrgustik (demo), BYK A: saada kasutaja küsimus DMR-iga B-le (pärast nõusolekut).
+# Kutsuvad network/consent (kasutaja vajutas "Jah") ja network/incoming (consentUi=off).
+# Ainult kasutaja küsimus läheb teisele asutusele (otsus 03.11.2026).
+declaration:
+  call: declare
+  version: 0.1
+  description: "Buerokratt network (demo): forward the end-user question to the organisation found"
+  method: post
+  accepts: json
+  returns: json
+  namespace: backoffice
+  allowlist:
+    body:
+      - field: chatId
+        type: string
+        description: "Chat id"
+      - field: requestId
+        type: string
+        description: "Network request id"
+
+assign_input:
+  assign:
+    chatId: ${incoming.body.chatId}
+    requestId: ${incoming.body.requestId}
+
+get_config:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "network_config"
+  error: return_error
+  result: config_res
+
+get_chat_messages:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-chat-messages"
+    body:
+      chatId: ${chatId}
+  error: return_error
+  result: messages_res
+
+assign_state:
+  assign:
+    cfg: "$=JSON.parse(config_res.response.body[0]?.value ?? '{}')="
+    pingIndex: ${messages_res.response.body.findIndex(m => m.forwardedByUser === 'nw-ping:' + requestId)}
+  next: check_pending
+
+# Ootel päring olemas ega ole veel edasi saadetud / tagasi lükatud
+check_pending:
+  switch:
+    - condition: ${pingIndex >= 0 && !messages_res.response.body.some(m => m.forwardedByUser === 'nw:' + requestId || m.forwardedByUser === 'nw-decl:' + requestId)}
+      next: get_request
+  next: return_not_pending
+
+# Siht (network/ask salvestas): configuration võti network_req:<päringu ID>
+get_request:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: ${'network_req:' + requestId}
+  error: return_error
+  result: request_res
+
+# Marker: nw-ping:<päringu ID>; küsimus = viimane kasutaja sõnum enne loa küsimust (või enne markerit)
+assign_target:
+  assign:
+    question: "${(i => messages_res.response.body.slice(0, i >= 0 ? i : pingIndex))(messages_res.response.body.findIndex(m => (m.buttons ?? '').includes('network-consent:yes:' + requestId))).filter(m => m.authorRole === 'end-user' && m.content).map(m => m.content).pop() ?? ''}"
+    targetId: "$=JSON.parse(request_res.response.body[0]?.value ?? '{}').targetId ?? ''="
+    targetName: "$=JSON.parse(request_res.response.body[0]?.value ?? '{}').targetName ?? 'teine asutus'="
+    now: ${new Date().toISOString()}
+  next: check_question
+
+check_question:
+  switch:
+    - condition: ${question !== '' && targetId !== ''}
+      next: get_dmr_uuid
+  next: return_error
+
+get_dmr_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  result: dmr_uuid_res
+
+get_message_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  result: message_uuid_res
+
+send_question:
+  call: http.post
+  args:
+    url: "http://dmr-agent:8077/v1/messages"
+    body:
+      id: ${dmr_uuid_res.response.body.uuid}
+      recipientId: ${targetId}
+      timestamp: ${now}
+      type: "ChatMessage"
+      payload:
+        chat:
+          id: ${chatId}
+          created: ${now}
+        messages:
+          - id: ${message_uuid_res.response.body.uuid}
+            chatId: ${chatId}
+            content: ${question}
+            event: "network_question"
+            authorTimestamp: ${now}
+            authorRole: "end-user"
+            options: "$=JSON.stringify({ requestId: requestId, from: cfg.orgName })="
+  timeout: 10000
+  error: return_send_failed
+  result: send_res
+
+get_info_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  result: info_uuid_res
+
+insert_forwarded:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${chatId}
+      messageId: ${info_uuid_res.response.body.uuid}
+      content: ${(cfg.texts?.forwarded ?? 'Edastasin teie küsimuse asutusele %ASUTUS%.').split('%ASUTUS%').join(targetName)}
+      authorTimestamp: ${now}
+      authorId: ""
+      authorFirstName: ""
+      authorRole: "buerokratt"
+      created: ${now}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: ${'nw:' + requestId}
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  result: insert_res
+
+notify_chats:
+  template: "[#CHATBOT_PROJECT_LAYER]/chats/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+  result: notify_chats_res
+
+notify_messages:
+  template: "[#CHATBOT_PROJECT_LAYER]/messages/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+    type: "message"
+    messageId: ${info_uuid_res.response.body.uuid}
+  result: notify_messages_res
+
+# Valikuline ajapiir (answerTimeoutS, 0 = väljas): notifications-node kutsub network/timeout
+check_timer:
+  switch:
+    - condition: ${Number(cfg.answerTimeoutS ?? 0) > 0}
+      next: start_timer
+  next: return_ok
+
+start_timer:
+  call: http.post
+  args:
+    url: "[#CHATBOT_NOTIFICATIONS]/network/timer"
+    body:
+      chatId: ${chatId}
+      requestId: ${requestId}
+      seconds: ${Number(cfg.answerTimeoutS)}
+      callbackUrl: "[#CHATBOT_RUUTER_PUBLIC_INTERNAL]/network/timeout"
+  timeout: 5000
+  error: return_ok
+  result: timer_res
+
+return_ok:
+  status: 200
+  return: "Question forwarded"
+  next: end
+
+return_not_pending:
+  status: 200
+  return: "No pending network request"
+  next: end
+
+return_send_failed:
+  status: 200
+  return: "Sending to DMR agent failed"
+  next: end
+
+return_error:
+  status: 200
+  return: "Network forward failed"
+  next: end

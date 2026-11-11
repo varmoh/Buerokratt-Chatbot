@@ -1,0 +1,97 @@
+# Bürokrati võrgustik (demo), BYK B: ühekordse lingi lunastamine.
+# Vidin (byk_handover=<token> aadressis) kutsub seda: token -> vestluse ID + chatJwt küpsis
+# (nagu chats/init), siis avab vidin selle vestluse. Token kehtib ühe korra.
+declaration:
+  call: declare
+  version: 0.1
+  description: "DMR network: redeem a one-time handover link"
+  method: post
+  accepts: json
+  returns: json
+  namespace: backoffice
+  allowlist:
+    body:
+      - field: token
+        type: string
+        description: "One-time handover token"
+
+assign_token:
+  assign:
+    token: ${incoming.body.token ?? ''}
+
+check_token_format:
+  switch:
+    - condition: ${token.length === 36 && token.split("-").length === 5}
+      next: get_handover
+  next: return_invalid
+
+get_handover:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: ${'network_handover:' + token}
+  error: return_invalid
+  result: handover_res
+
+assign_handover:
+  assign:
+    handoverChatId: ${handover_res.response.body[0]?.value ?? ''}
+  next: check_handover
+
+check_handover:
+  switch:
+    - condition: ${handoverChatId !== '' && handoverChatId !== 'used'}
+      next: mark_used
+  next: return_invalid
+
+mark_used:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/set-configuration-value"
+    body:
+      key: ${'network_handover:' + token}
+      value: "used"
+      created: ${new Date().toISOString()}
+  result: mark_used_res
+
+get_session_length:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "session_length"
+  result: session_result
+
+generate_cookie:
+  call: http.post
+  args:
+    url: "[#CHATBOT_TIM]/jwt/custom-jwt-generate"
+    body:
+      JWTName: "chatJwt"
+      expirationInMinutes: ${session_result.response.body[0]?.value ?? '120'}
+      content:
+        chatId: "${handoverChatId}"
+        chatIds: ${[handoverChatId]}
+        forwardTo: ""
+  result: cookie_result
+
+assign_cookie:
+  assign:
+    setCookie:
+      chatJwt: ${cookie_result.response.body.token}
+      Domain: "[#DOMAIN]"
+      Secure: true
+      HttpOnly: true
+      SameSite: "[#COOKIE_SAME_SITE]"
+
+return_result:
+  headers:
+    Set-Cookie: ${setCookie}
+  return: ${handoverChatId}
+  next: end
+
+return_invalid:
+  status: 404
+  return: "Link is invalid, expired or already used"
+  next: end

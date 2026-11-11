@@ -1,0 +1,153 @@
+# Bürokrati võrgustik (demo), BYK A: oma bot ei osanud vastata.
+# Kutsub chats/messages/llm.yml (network_forward). Seadistus: configuration võti network_config.
+# Esmalt küsitakse kasutajalt luba võrgustikust otsida (asutust veel ei nimetata). Vidina nupp kutsub
+# network/consent; "jah" korral otsib internal/network-search (gc-mock, aktiivsus, edastus).
+declaration:
+  call: declare
+  version: 0.1
+  description: "Buerokratt network (demo): ask the end user for permission to search the network"
+  method: post
+  accepts: json
+  returns: json
+  namespace: backoffice
+  allowlist:
+    body:
+      - field: chatId
+        type: string
+        description: "Chat id"
+
+assign_input:
+  assign:
+    chatId: ${incoming.body.chatId}
+
+get_config:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "network_config"
+  error: return_disabled
+  result: config_res
+
+assign_config:
+  assign:
+    cfg: "$=JSON.parse(config_res.response.body[0]?.value ?? '{}')="
+  next: check_config
+
+check_config:
+  switch:
+    - condition: ${(cfg.gcUrl ?? '') !== '' && (cfg.agentId ?? '') !== ''}
+      next: get_chat_messages
+  next: return_disabled
+
+get_chat_messages:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-chat-messages"
+    body:
+      chatId: ${chatId}
+  error: return_error
+  result: messages_res
+
+check_question:
+  switch:
+    - condition: ${messages_res.response.body.some(m => m.authorRole === 'end-user' && m.content)}
+      next: get_request_uuid
+  next: return_no_question
+
+get_request_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  error: return_error
+  result: request_uuid_res
+
+assign_request:
+  assign:
+    requestId: ${request_uuid_res.response.body.uuid}
+  next: route_consent
+
+route_consent:
+  switch:
+    - condition: ${(cfg.consentUi ?? 'buttons') === 'off'}
+      next: search
+  next: get_bot_name
+
+# Nõusolekut ei küsita: otsi kohe
+search:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RUUTER_PUBLIC_INTERNAL]/internal/network-search"
+    body:
+      chatId: ${chatId}
+      requestId: ${requestId}
+  timeout: 20000
+  error: return_error
+  result: search_res
+  next: return_ok
+
+get_bot_name:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "bot_institution_id"
+  result: bot_name_res
+
+# 1. loa küsimus (otsimine; asutust ei nimetata). buttons: vidina nupud; redirect: vidina nõusolekuvaade (requested-chat-forward).
+# Nupu payload kannab päringu ID-d (#network-consent:yes|no:<id>), vidin kutsub network/consent.
+insert_consent:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-bot-message"
+    body:
+      messages:
+        - chatId: ${chatId}
+          content: ${cfg.texts?.consent ?? 'Ma ei oska teie küsimusele vastata. Kas tohin otsida, kes oskaks vastata?'}
+          buttons: "$=JSON.stringify([{ title: cfg.texts?.consentYes ?? 'Jah', payload: '#network-consent:yes:' + requestId }, { title: cfg.texts?.consentNo ?? 'Ei', payload: '#network-consent:no:' + requestId }])="
+          event: "${(cfg.consentUi ?? 'buttons') === 'redirect' ? 'requested-chat-forward' : ''}"
+          authorTimestamp: ${new Date().toISOString()}
+          authorId: ${bot_name_res.response.body[0]?.value ?? 'chatbot'}
+          authorFirstName: ""
+          authorLastName: ""
+          created: ${new Date().toISOString()}
+  error: return_error
+  result: consent_res
+
+notify_chats:
+  template: "[#CHATBOT_PROJECT_LAYER]/chats/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+  result: notify_chats_res
+
+notify_messages:
+  template: "[#CHATBOT_PROJECT_LAYER]/messages/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+    type: "message"
+    messageId: ""
+  result: notify_messages_res
+
+return_ok:
+  status: 200
+  return: "Permission asked"
+  next: end
+
+return_no_question:
+  status: 200
+  return: "No end-user question in chat"
+  next: end
+
+return_disabled:
+  status: 200
+  return: "Network is not configured (network_config)"
+  next: end
+
+return_error:
+  status: 200
+  return: "Network forwarding failed"
+  next: end

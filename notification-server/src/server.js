@@ -309,6 +309,7 @@ setInterval(
   5 * 60 * 1000,
 );
 
+require('./networkAnswer').register(app);
 const server = app.listen(serverConfig.port, () => {
   console.log(`Server running on port ${serverConfig.port}`);
 });

@@ -1,0 +1,283 @@
+# Bürokrati võrgustik (demo), BYK A: kasutaja lubas võrgustikust otsida (network/consent "jah").
+# 1) kasutaja küsimus (viimane enne nõusoleku küsimust)  2) gc-mock: kes vastab?
+# 3) DMR-iga aktiivsuse päring (network_ping). Aktiivse B korral saadab network/incoming küsimuse edasi.
+declaration:
+  call: declare
+  version: 0.1
+  description: "Buerokratt network (demo): find an organisation that can answer and check if it is active (after consent)"
+  method: post
+  accepts: json
+  returns: json
+  namespace: backoffice
+  allowlist:
+    body:
+      - field: chatId
+        type: string
+        description: "Chat id"
+      - field: requestId
+        type: string
+        description: "Network request id (from network/ask)"
+
+assign_input:
+  assign:
+    chatId: ${incoming.body.chatId}
+    requestId: ${incoming.body.requestId ?? ''}
+
+get_config:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "network_config"
+  error: return_disabled
+  result: config_res
+
+assign_config:
+  assign:
+    cfg: "$=JSON.parse(config_res.response.body[0]?.value ?? '{}')="
+  next: check_config
+
+check_config:
+  switch:
+    - condition: ${(cfg.gcUrl ?? '') !== '' && (cfg.agentId ?? '') !== '' && requestId !== ''}
+      next: get_chat_messages
+  next: return_disabled
+
+get_chat_messages:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-chat-messages"
+    body:
+      chatId: ${chatId}
+  error: return_error
+  result: messages_res
+
+assign_question:
+  assign:
+    question: "${(i => messages_res.response.body.slice(0, i >= 0 ? i : messages_res.response.body.length))(messages_res.response.body.findIndex(m => (m.buttons ?? '').includes('network-consent:yes:' + requestId))).filter(m => m.authorRole === 'end-user' && m.content).map(m => m.content).pop() ?? ''}"
+  next: check_question
+
+check_question:
+  switch:
+    - condition: ${question !== ''}
+      next: classify
+  next: return_no_question
+
+# Global Classifier (mock). Ainult küsimus ja küsija ID, sisu gc-mock ei salvesta.
+classify:
+  call: http.post
+  args:
+    url: "${cfg.gcUrl + '/classify'}"
+    body:
+      question: ${question}
+      senderId: ${cfg.agentId ?? ''}
+  timeout: 10000
+  error: no_target
+  result: classify_res
+
+check_target:
+  switch:
+    - condition: ${(classify_res.response.body.clientId ?? '') !== '' && classify_res.response.body.clientId !== cfg.agentId}
+      next: get_dmr_uuid
+  next: no_target
+
+get_dmr_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  error: return_error
+  result: dmr_uuid_res
+
+get_message_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  error: return_error
+  result: message_uuid_res
+
+get_bot_name:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "bot_institution_id"
+  result: bot_name_res
+
+assign_ids:
+  assign:
+    targetId: ${classify_res.response.body.clientId}
+    targetName: ${classify_res.response.body.name ?? 'teine asutus'}
+    botName: ${bot_name_res.response.body[0]?.value ?? 'chatbot'}
+    now: ${new Date().toISOString()}
+  next: send_ping
+
+# Aktiivsuse kontroll (voog v6): päringus küsimust pole
+send_ping:
+  call: http.post
+  args:
+    url: "http://dmr-agent:8077/v1/messages"
+    body:
+      id: ${dmr_uuid_res.response.body.uuid}
+      recipientId: ${targetId}
+      timestamp: ${now}
+      type: "ChatMessage"
+      payload:
+        chat:
+          id: ${chatId}
+          created: ${now}
+        messages:
+          - id: ${message_uuid_res.response.body.uuid}
+            chatId: ${chatId}
+            content: ""
+            event: "network_ping"
+            authorTimestamp: ${now}
+            authorRole: "buerokratt"
+            options: "$=JSON.stringify({ requestId: requestId, from: cfg.orgName })="
+  timeout: 10000
+  error: no_target
+  result: ping_res
+
+get_info_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  result: info_uuid_res
+
+# Päringu andmed (siht) configuration tabelisse: forwarded_by_user on varchar(50), sinna mahub ainult ID
+save_request:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/set-configuration-value"
+    body:
+      key: ${'network_req:' + requestId}
+      value: "$=JSON.stringify({ targetId: targetId, targetName: targetName, chatId: chatId })="
+      created: ${now}
+  error: return_error
+  result: save_request_res
+
+# Ootel päringu marker: nw-ping:<päringu ID>
+insert_checking:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${chatId}
+      messageId: ${info_uuid_res.response.body.uuid}
+      content: ${(cfg.texts?.checking ?? 'Kontrollin, kas %ASUTUS% saab vastata.').split('%ASUTUS%').join(targetName)}
+      authorTimestamp: ${now}
+      authorId: ${botName}
+      authorFirstName: ""
+      authorRole: "buerokratt"
+      created: ${now}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: ${'nw-ping:' + requestId}
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  result: insert_res
+
+notify_chats:
+  template: "[#CHATBOT_PROJECT_LAYER]/chats/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+  result: notify_chats_res
+
+notify_messages:
+  template: "[#CHATBOT_PROJECT_LAYER]/messages/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+    type: "message"
+    messageId: ${info_uuid_res.response.body.uuid}
+  result: notify_messages_res
+
+return_ok:
+  status: 200
+  return: "Activity check sent"
+  next: end
+
+# Sobivat asutust pole (või saatmine ebaõnnestus): teata kasutajale
+no_target:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  error: return_error
+  result: no_target_uuid_res
+
+no_target_bot_name:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "bot_institution_id"
+  result: no_target_bot_res
+
+no_target_insert:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${chatId}
+      messageId: ${no_target_uuid_res.response.body.uuid}
+      content: ${cfg.texts?.noTarget ?? 'Kahjuks ei leidnud ma võrgustikust asutust, kes oskaks vastata.'}
+      authorTimestamp: ${new Date().toISOString()}
+      authorId: ${no_target_bot_res.response.body[0]?.value ?? 'chatbot'}
+      authorFirstName: ""
+      authorRole: "buerokratt"
+      created: ${new Date().toISOString()}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: "nw-no-target"
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  error: return_error
+  result: no_target_insert_res
+
+no_target_notify_chats:
+  template: "[#CHATBOT_PROJECT_LAYER]/chats/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+  result: no_target_notify_chats_res
+
+no_target_notify_messages:
+  template: "[#CHATBOT_PROJECT_LAYER]/messages/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+    type: "message"
+    messageId: ${no_target_uuid_res.response.body.uuid}
+  result: no_target_notify_messages_res
+
+return_no_target:
+  status: 200
+  return: "No suitable organisation in the network"
+  next: end
+
+return_no_question:
+  status: 200
+  return: "No end-user question in chat"
+  next: end
+
+return_disabled:
+  status: 200
+  return: "Network is not configured (network_config)"
+  next: end
+
+return_error:
+  status: 200
+  return: "Network forwarding failed"
+  next: end

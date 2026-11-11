@@ -1,0 +1,199 @@
+# Bürokrati võrgustik (demo), BYK A: kasutaja vastas loa küsimusele vidinas ("kas tohin võrgustikust otsida?").
+# 1. etapp requestId=<id>      (otsimine):   jah -> internal/network-search; ei -> klienditeenindaja pakkumine
+# 2. etapp requestId=fwd:<id>  (edastamine): jah -> internal/network-forward; ei -> klienditeenindaja pakkumine
+# Vidin kutsub seda nupuvajutusel (payload #network-consent:yes|no:<päringu ID>), chatJwt küpsisega.
+declaration:
+  call: declare
+  version: 0.1
+  description: "Buerokratt network (demo): end-user consent for forwarding the question"
+  method: post
+  accepts: json
+  returns: json
+  namespace: backoffice
+  allowlist:
+    body:
+      - field: chatId
+        type: string
+        description: "Chat id"
+      - field: requestId
+        type: string
+        description: "Network request id"
+      - field: accept
+        type: boolean
+        description: "true = forward, false = do not forward"
+    header:
+      - field: cookie
+        type: string
+        description: "Cookie field"
+
+assign_input:
+  assign:
+    chatId: ${incoming.body.chatId ?? ''}
+    requestId: ${incoming.body.requestId ?? ''}
+    accept: ${incoming.body.accept === true}
+    stage: "${(incoming.body.requestId ?? '').startsWith('fwd:') ? 'forward' : 'search'}"
+    rid: "${(incoming.body.requestId ?? '').startsWith('fwd:') ? incoming.body.requestId.slice(4) : (incoming.body.requestId ?? '')}"
+
+# Vestlus peab kuuluma küpsise omanikule (nagu chats/get)
+get_chat_info:
+  call: http.post
+  args:
+    url: "[#CHATBOT_TIM]/jwt/custom-jwt-userinfo"
+    contentType: plaintext
+    headers:
+      cookie: ${incoming.headers.cookie}
+    plaintext: "chatJwt"
+  error: return_forbidden
+  result: info_res
+
+check_owner:
+  switch:
+    - condition: ${chatId !== '' && requestId !== '' && ((info_res.response.body?.chatIds ?? []).includes(chatId) || info_res.response.body?.chatId === chatId)}
+      next: get_config
+  next: return_forbidden
+
+get_config:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "network_config"
+  error: return_error
+  result: config_res
+
+get_chat_messages:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-chat-messages"
+    body:
+      chatId: ${chatId}
+  error: return_error
+  result: messages_res
+
+assign_state:
+  assign:
+    cfg: "$=JSON.parse(config_res.response.body[0]?.value ?? '{}')="
+  next: check_pending
+
+check_pending:
+  switch:
+    - condition: ${stage === 'search' && messages_res.response.body.some(m => (m.buttons ?? '').includes('network-consent:yes:' + rid)) && !messages_res.response.body.some(m => m.forwardedByUser === 'nw-ping:' + rid || m.forwardedByUser === 'nw-no-target' || m.forwardedByUser === 'nw-decl:' + rid)}
+      next: insert_user_choice
+    - condition: ${stage === 'forward' && messages_res.response.body.some(m => (m.buttons ?? '').includes('network-consent:yes:fwd:' + rid)) && messages_res.response.body.some(m => m.forwardedByUser === 'nw-ping:' + rid) && !messages_res.response.body.some(m => m.forwardedByUser === 'nw:' + rid || m.forwardedByUser === 'nw-decl:' + rid || m.forwardedByUser === 'nw-unav:' + rid)}
+      next: insert_user_choice
+  next: return_not_pending
+
+# Kasutaja valik vestlusesse (nagu nupu tavaline sõnum)
+insert_user_choice:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${chatId}
+      messageId: "${rid.slice(0, 24) + (stage === 'forward' ? (accept ? 'dddddddddddd' : 'eeeeeeeeeeee') : (accept ? 'aaaaaaaaaaaa' : 'bbbbbbbbbbbb'))}"
+      content: "${stage === 'forward' ? (accept ? (cfg.texts?.forwardYes ?? 'Jah') : (cfg.texts?.forwardNo ?? 'Ei')) : (accept ? (cfg.texts?.consentYes ?? 'Jah') : (cfg.texts?.consentNo ?? 'Ei'))}"
+      authorTimestamp: ${new Date().toISOString()}
+      authorId: ""
+      authorFirstName: ""
+      authorRole: "end-user"
+      created: ${new Date().toISOString()}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: ""
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  error: return_error
+  result: choice_res
+
+route_choice:
+  switch:
+    - condition: ${accept === true && stage === 'search'}
+      next: search
+    - condition: ${accept === true}
+      next: forward
+  next: insert_declined
+
+search:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RUUTER_PUBLIC_INTERNAL]/internal/network-search"
+    body:
+      chatId: ${chatId}
+      requestId: ${rid}
+  timeout: 20000
+  error: return_error
+  result: search_res
+  next: return_ok
+
+forward:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RUUTER_PUBLIC_INTERNAL]/internal/network-forward"
+    body:
+      chatId: ${chatId}
+      requestId: ${rid}
+  timeout: 15000
+  error: return_error
+  result: forward_res
+  next: return_ok
+
+insert_declined:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${chatId}
+      messageId: "${rid.slice(0, 24) + (stage === 'forward' ? 'ffffffffffff' : 'cccccccccccc')}"
+      content: "${stage === 'forward' ? (cfg.texts?.declinedForward ?? 'Selge, ma ei edasta teie küsimust.') : (cfg.texts?.declined ?? 'Selge.')}"
+      authorTimestamp: ${new Date().toISOString()}
+      authorId: ""
+      authorFirstName: ""
+      authorRole: "buerokratt"
+      created: ${new Date(Date.now() + 1000).toISOString()}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: ${'nw-decl:' + rid}
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  error: return_error
+  result: declined_res
+
+notify_chats:
+  template: "[#CHATBOT_PROJECT_LAYER]/chats/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+  result: notify_chats_res
+
+notify_messages:
+  template: "[#CHATBOT_PROJECT_LAYER]/messages/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+    type: "message"
+    messageId: ""
+  result: notify_messages_res
+
+return_ok:
+  status: 200
+  return: "OK"
+  next: end
+
+return_not_pending:
+  status: 200
+  return: "No pending consent"
+  next: end
+
+return_forbidden:
+  status: 403
+  return: "Forbidden"
+  next: end
+
+return_error:
+  status: 500
+  return: "Error"
+  next: end

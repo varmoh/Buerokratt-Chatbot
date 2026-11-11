@@ -1,0 +1,692 @@
+# Bürokrati võrgustik (demo): DMR agendilt saabunud sõnumid (agendi OUTGOING_MESSAGE_ENDPOINT).
+# Seadistus: configuration võti network_config (demo.sh install).
+# BYK B (vastaja):
+#   network_ping      -> aktiivsus (is_bot_active + network_participation) -> network_pong
+#   network_question  -> sama kontroll uuesti; B loob oma vestluse, küsib oma botilt (sama tee mis vidinas:
+#                        internal/client-external-bot, vastus notifications-node /network/result kaudu)
+#                        ja saadab ühekordse lingi -> network_answer {handoverUrl}
+# BYK A (küsija):
+#   network_pong      -> aktiivne: 2. loa küsimus vidinas (edastamine; consentUi=off: kohe edasi); ei: teade
+#   network_answer / network_no_answer -> link B vidinasse (A lõpetab oma vestluse) või teade
+# nettest-* päringute vastused lähevad testvastuvõtjale (demo.sh test).
+declaration:
+  call: declare
+  version: 0.1
+  description: "Buerokratt network (demo): incoming messages from the DMR agent"
+  method: post
+  accepts: json
+  returns: json
+  namespace: backoffice
+  allowlist:
+    body:
+      - field: id
+        type: string
+        description: "DMR message id"
+      - field: senderId
+        type: string
+        description: "Sender agent id"
+      - field: recipientId
+        type: string
+        description: "Recipient agent id (this Buerokratt)"
+      - field: timestamp
+        type: string
+        description: "Message timestamp"
+      - field: type
+        type: string
+        description: "DMR message type"
+      - field: payload
+        type: json
+        description: "ChatMessage payload: chat + messages"
+
+assign_input:
+  assign:
+    dmrId: ${incoming.body.id}
+    senderId: ${incoming.body.senderId}
+    chatId: ${incoming.body.payload?.chat?.id}
+    msg: "$=incoming.body.payload?.messages?.[0] ?? {}="
+
+get_config:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "network_config"
+  error: return_ignored
+  result: config_res
+
+assign_event:
+  assign:
+    cfg: "$=JSON.parse(config_res.response.body[0]?.value ?? '{}')="
+    event: ${msg.event ?? ''}
+    meta: "$=msg.options ? JSON.parse(msg.options) : {}="
+  next: dispatch
+
+dispatch:
+  switch:
+    - condition: ${(cfg.orgName ?? '') === ''}
+      next: return_ignored
+    - condition: ${event === 'network_ping' || event === 'network_question'}
+      next: get_bot_active
+    - condition: ${(event === 'network_pong' || event === 'network_answer' || event === 'network_no_answer') && (meta.inReplyTo ?? '').startsWith('nettest-')}
+      next: forward_to_test_receiver
+    - condition: ${event === 'network_pong'}
+      next: pong_get_chat_messages
+    - condition: ${event === 'network_answer' || event === 'network_no_answer'}
+      next: answer_get_chat_messages
+  next: return_ignored
+
+# ================================================================ BYK B
+get_bot_active:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "is_bot_active"
+  error: assign_check_failed
+  result: bot_active_res
+
+get_network_participation:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "network_participation"
+  error: assign_check_failed
+  result: participation_res
+
+assign_activity:
+  assign:
+    botActive: ${bot_active_res.response.body[0]?.value === 'true'}
+    participates: ${(participation_res.response.body[0]?.value ?? 'true') !== 'false'}
+  next: assign_activity_result
+
+assign_activity_result:
+  assign:
+    active: ${botActive === true && participates === true}
+    activityReason: "${botActive !== true ? 'bot_inactive' : (participates !== true ? 'network_disabled' : 'ok')}"
+  next: route_after_check
+
+assign_check_failed:
+  assign:
+    active: false
+    activityReason: "check_failed"
+  next: route_after_check
+
+route_after_check:
+  switch:
+    - condition: ${event === 'network_ping'}
+      next: assign_pong
+    - condition: ${active === true}
+      next: b_get_chat_uuid
+  next: assign_inactive_answer
+
+assign_pong:
+  assign:
+    replyEvent: "network_pong"
+    replyContent: ""
+    replyOptions: "$=JSON.stringify({ inReplyTo: meta.requestId ?? '', org: cfg.orgName, active: active, reason: activityReason })="
+  next: get_reply_uuid
+
+# Teine kontroll üleandmisel: B on vahepeal välja lülitatud
+assign_inactive_answer:
+  assign:
+    replyEvent: "network_no_answer"
+    replyContent: ""
+    replyOptions: "$=JSON.stringify({ inReplyTo: meta.requestId ?? '', org: cfg.orgName, source: 'none', reason: activityReason })="
+  next: get_reply_uuid
+
+# ---------------------------------------------------------------- B: üleandmine
+b_get_chat_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  error: assign_handover_failed
+  result: b_chat_uuid_res
+
+b_get_token:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  error: assign_handover_failed
+  result: b_token_res
+
+b_assign_ids:
+  assign:
+    bChatId: ${b_chat_uuid_res.response.body.uuid}
+    bToken: ${b_token_res.response.body.uuid}
+  next: b_listen
+
+# B bot vastab sama teega nagu vidinas. notifications-node kogub voo kokku (/network/listen + /network/result).
+b_listen:
+  call: http.post
+  args:
+    url: "[#CHATBOT_NOTIFICATIONS]/network/listen"
+    body:
+      channelId: ${bChatId}
+  timeout: 10000
+  error: assign_no_answer
+  result: b_listen_res
+
+b_trigger:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RUUTER_PUBLIC_INTERNAL]/internal/client-external-bot"
+    body:
+      sender: ${bChatId}
+      message: ${msg.content ?? ''}
+      domain: "none"
+  timeout: 20000
+  error: assign_no_answer
+  result: b_trigger_res
+
+b_check_trigger:
+  switch:
+    - condition: ${b_trigger_res.response.body.response === 'stream triggered'}
+      next: b_result
+  next: assign_no_answer
+
+# Kogu B töötlus peab mahtuma DMR serveri ooteaja sisse (60 s), muidu server saadab uuesti.
+b_result:
+  call: http.post
+  args:
+    url: "[#CHATBOT_NOTIFICATIONS]/network/result"
+    body:
+      channelId: ${bChatId}
+      timeoutMs: 35000
+  timeout: 40000
+  error: assign_no_answer
+  result: b_result_res
+
+b_assign_result:
+  assign:
+    bContent: ${(b_result_res.response.body.content ?? '').trim()}
+  next: b_check_answer
+
+# "Ei tea" vastus (samad tekstid, mis A poolel võrgustiku käivitavad) ei ole vastus
+b_check_answer:
+  switch:
+    - condition: ${b_result_res.response.body.status === 'complete' && bContent !== '' && !(cfg.triggerPrefixes ?? []).some(p => bContent.startsWith(p)) && !(cfg.triggerContains ?? []).some(p => bContent.includes(p))}
+      next: assign_answer
+  next: assign_no_answer
+
+assign_answer:
+  assign:
+    bAnswered: true
+    bText: ${bContent}
+  next: b_get_bot_name
+
+# B ei oska: vestlus antakse ikkagi B-le üle, B pakub oma klienditeenindajat (demo: ainult teade)
+assign_no_answer:
+  assign:
+    bAnswered: false
+    bText: ${cfg.texts?.bNoAnswer ?? 'Kahjuks ei leidnud ma teie küsimusele vastust.'}
+  next: b_get_bot_name
+
+b_get_bot_name:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "bot_institution_id"
+  error: assign_handover_failed
+  result: b_bot_name_res
+
+b_get_question_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  error: assign_handover_failed
+  result: b_question_uuid_res
+
+b_get_answer_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  error: assign_handover_failed
+  result: b_answer_uuid_res
+
+b_assign_times:
+  assign:
+    bNow: ${new Date().toISOString()}
+    bLater: ${new Date(Date.now() + 1000).toISOString()}
+    bBotName: ${b_bot_name_res.response.body[0]?.value ?? 'chatbot'}
+  next: b_init_chat
+
+b_init_chat:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/init-chat"
+    body:
+      id: ${bChatId}
+      endUserId: ""
+      endUserFirstName: ""
+      endUserLastName: ""
+      status: "OPEN"
+      created: ${bNow}
+      ended: ""
+      feedbackRating: ""
+      feedbackText: ""
+      endUserEmail: ""
+      endUserPhone: ""
+      endUserOs: ""
+      endUserUrl: ""
+      domain: "none"
+      externalId: ""
+      forwardedTo: ""
+      forwardedToName: ""
+      receivedFrom: ""
+      receivedFromName: ${meta.from ?? ''}
+  error: assign_handover_failed
+  result: b_init_chat_res
+
+b_insert_question:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${bChatId}
+      messageId: ${b_question_uuid_res.response.body.uuid}
+      content: ${msg.content ?? ''}
+      authorTimestamp: ${bNow}
+      authorId: ""
+      authorFirstName: ""
+      authorRole: "end-user"
+      created: ${bNow}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: ""
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  error: assign_handover_failed
+  result: b_insert_question_res
+
+b_insert_answer:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${bChatId}
+      messageId: ${b_answer_uuid_res.response.body.uuid}
+      content: ${bText}
+      authorTimestamp: ${bLater}
+      authorId: ${bBotName}
+      authorFirstName: ""
+      authorRole: "buerokratt"
+      created: ${bLater}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: ""
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  error: assign_handover_failed
+  result: b_insert_answer_res
+
+# Ühekordne link: network_handover:<token> = vestluse ID (network/handover lunastab)
+b_save_token:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/set-configuration-value"
+    body:
+      key: ${'network_handover:' + bToken}
+      value: ${bChatId}
+      created: ${bNow}
+  error: assign_handover_failed
+  result: b_save_token_res
+
+assign_handover_reply:
+  assign:
+    replyEvent: "network_answer"
+    replyContent: "${(meta.requestId ?? '').startsWith('nettest-') ? bText : ''}"
+    replyOptions: "$=JSON.stringify({ inReplyTo: meta.requestId ?? '', org: cfg.orgName, answered: bAnswered, handoverUrl: (cfg.widgetUrl ?? '') + '/?byk_handover=' + bToken })="
+  next: get_reply_uuid
+
+assign_handover_failed:
+  assign:
+    replyEvent: "network_no_answer"
+    replyContent: ""
+    replyOptions: "$=JSON.stringify({ inReplyTo: meta.requestId ?? '', org: cfg.orgName, source: 'none', reason: 'handover_failed' })="
+  next: get_reply_uuid
+
+# ---------------------------------------------------------------- vastus DMR-iga tagasi
+get_reply_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  result: reply_uuid_res
+
+get_reply_message_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  result: reply_message_uuid_res
+
+assign_now:
+  assign:
+    now: ${new Date().toISOString()}
+
+send_reply:
+  call: http.post
+  args:
+    url: "http://dmr-agent:8077/v1/messages"
+    body:
+      id: ${reply_uuid_res.response.body.uuid}
+      recipientId: ${senderId}
+      timestamp: ${now}
+      type: "ChatMessage"
+      payload:
+        chat:
+          id: ${chatId}
+          created: ${now}
+        messages:
+          - id: ${reply_message_uuid_res.response.body.uuid}
+            chatId: ${chatId}
+            content: ${replyContent}
+            event: ${replyEvent}
+            authorTimestamp: ${now}
+            authorRole: "buerokratt"
+            options: ${replyOptions}
+  timeout: 10000
+  error: return_reply_failed
+  result: reply_res
+  next: return_ok
+
+# ================================================================ BYK A
+# ---------------------------------------------------------------- aktiivsuse vastus (network_pong)
+pong_get_chat_messages:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-chat-messages"
+    body:
+      chatId: ${chatId}
+  error: return_ignored
+  result: pong_messages_res
+
+pong_assign:
+  assign:
+    pongId: ${meta.inReplyTo ?? ''}
+    pongMarker: ${pong_messages_res.response.body.find(m => m.forwardedByUser === 'nw-ping:' + (meta.inReplyTo ?? ''))?.forwardedByUser ?? ''}
+  next: pong_check_pending
+
+# Ootel aktiivsuse päring peab olemas olema ja seda ei tohi olla juba käsitletud
+pong_check_pending:
+  switch:
+    - condition: ${pongId !== '' && pongMarker !== '' && !pong_messages_res.response.body.some(m => (m.buttons ?? '').includes('network-consent:yes:fwd:' + pongId) || m.forwardedByUser === 'nw:' + pongId || m.forwardedByUser === 'nw-unav:' + pongId)}
+      next: pong_route
+  next: return_ignored
+
+pong_route:
+  switch:
+    - condition: ${meta.active === true && (cfg.consentUi ?? 'buttons') === 'off'}
+      next: pong_forward
+    - condition: ${meta.active === true}
+      next: pong_get_bot_name
+  next: pong_unavailable
+
+pong_forward:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RUUTER_PUBLIC_INTERNAL]/internal/network-forward"
+    body:
+      chatId: ${chatId}
+      requestId: ${pongId}
+  timeout: 15000
+  error: return_ok
+  result: pong_forward_res
+  next: return_ok
+
+pong_get_bot_name:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-configuration"
+    body:
+      key: "bot_institution_id"
+  result: pong_bot_name_res
+
+# 2. loa küsimus (edastamine; asutus on nüüd teada). Payload #network-consent:yes|no:fwd:<päringu ID>,
+# vidin kutsub network/consent requestId=fwd:<id>.
+pong_insert_consent:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-bot-message"
+    body:
+      messages:
+        - chatId: ${chatId}
+          content: ${(cfg.texts?.forwardConsent ?? 'Teie küsimusele oskab vastata %ASUTUS%. Kas tohin teie küsimuse edastada?').split('%ASUTUS%').join(meta.org ?? 'teine asutus')}
+          buttons: "$=JSON.stringify([{ title: cfg.texts?.forwardYes ?? 'Jah', payload: '#network-consent:yes:fwd:' + pongId }, { title: cfg.texts?.forwardNo ?? 'Ei', payload: '#network-consent:no:fwd:' + pongId }])="
+          event: "${(cfg.consentUi ?? 'buttons') === 'redirect' ? 'requested-chat-forward' : ''}"
+          authorTimestamp: ${new Date().toISOString()}
+          authorId: ${pong_bot_name_res.response.body[0]?.value ?? 'chatbot'}
+          authorFirstName: ""
+          authorLastName: ""
+          created: ${new Date().toISOString()}
+  error: return_ignored
+  result: pong_consent_res
+  next: pong_notify_chats
+
+pong_unavailable:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${chatId}
+      messageId: ${dmrId}
+      content: ${(cfg.texts?.unavailable ?? 'Kahjuks ei saa %ASUTUS% praegu vastata.').split('%ASUTUS%').join(meta.org ?? 'teine asutus')}
+      authorTimestamp: ${new Date().toISOString()}
+      authorId: ""
+      authorFirstName: ""
+      authorRole: "buerokratt"
+      created: ${new Date().toISOString()}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: ${'nw-unav:' + pongId}
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  error: return_ignored
+  result: pong_unavailable_res
+
+pong_notify_chats:
+  template: "[#CHATBOT_PROJECT_LAYER]/chats/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+  result: pong_notify_chats_res
+
+pong_notify_messages:
+  template: "[#CHATBOT_PROJECT_LAYER]/messages/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+    type: "message"
+    messageId: ""
+  result: pong_notify_messages_res
+  next: return_ok
+
+# ---------------------------------------------------------------- vastus (network_answer / no_answer)
+answer_get_chat_messages:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-chat-messages"
+    body:
+      chatId: ${chatId}
+  error: return_ignored
+  result: messages_res
+
+# Võetakse vastu ainult ootel päringule (nw:<id>), mida pole veel vastatud ega aegunud
+check_pending:
+  switch:
+    - condition: ${(meta.inReplyTo ?? '') !== '' && messages_res.response.body.some(m => m.forwardedByUser === 'nw:' + meta.inReplyTo) && !messages_res.response.body.some(m => m.forwardedByUser === 'nw-ans:' + meta.inReplyTo)}
+      next: get_answer_uuid
+  next: return_ignored
+
+get_answer_uuid:
+  call: http.post
+  args:
+    url: "[#CHATBOT_DMAPPER_HBS]/return_uuid"
+    headers:
+      type: json
+  result: answer_uuid_res
+
+assign_answer_message:
+  assign:
+    answerId: ${answer_uuid_res.response.body.uuid}
+    org: ${meta.org ?? 'teine asutus'}
+    isHandover: ${event === 'network_answer' && (meta.handoverUrl ?? '') !== ''}
+    now: ${new Date().toISOString()}
+  next: assign_answer_text
+
+assign_answer_text:
+  assign:
+    text: "${(isHandover ? (cfg.texts?.handover ?? '%ASUTUS%: %LINK%').split('%LINK%').join(meta.handoverUrl) : (cfg.texts?.unavailable ?? 'Kahjuks ei saa %ASUTUS% praegu vastata.')).split('%ASUTUS%').join(org)}"
+  next: insert_answer
+
+insert_answer:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-message"
+    body:
+      chatId: ${chatId}
+      messageId: ${answerId}
+      content: ${text}
+      authorTimestamp: ${now}
+      authorId: ""
+      authorFirstName: ""
+      authorRole: "buerokratt"
+      created: ${now}
+      authorLastName: ""
+      rating: ""
+      event: ""
+      forwardedByUser: ${'nw-ans:' + meta.inReplyTo}
+      forwardedFromCsa: ""
+      forwardedToCsa: ""
+      endUserUrl: ""
+  result: insert_answer_res
+
+notify_chats:
+  template: "[#CHATBOT_PROJECT_LAYER]/chats/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+  result: chats_notify_res
+
+notify_messages:
+  template: "[#CHATBOT_PROJECT_LAYER]/messages/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+    type: "message"
+    messageId: ${answerId}
+  result: messages_notify_res
+  next: check_end_a_chat
+
+# Üleandmisel lõpetab A oma vestluse: vestlus jätkub B-s
+check_end_a_chat:
+  switch:
+    - condition: ${isHandover === true && cfg.endA !== false}
+      next: a_get_active_chat
+  next: return_ok
+
+a_get_active_chat:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/get-active-chat-by-id"
+    body:
+      id: ${chatId}
+  error: return_ok
+  result: a_active_chat_res
+
+a_check_active_chat:
+  switch:
+    - condition: ${a_active_chat_res.response.body.length > 0}
+      next: a_end_chat
+  next: return_ok
+
+a_end_chat:
+  call: http.post
+  args:
+    url: "[#CHATBOT_RESQL]/insert-chat"
+    body:
+      id: ${a_active_chat_res.response.body[0].id}
+      customerSupportId: ${a_active_chat_res.response.body[0].customerSupportId ?? ""}
+      customerSupportDisplayName: ${a_active_chat_res.response.body[0].customerSupportDisplayName ?? ""}
+      csaTitle: ${a_active_chat_res.response.body[0].csaTitle ?? ""}
+      endUserId: ${a_active_chat_res.response.body[0].endUserId ?? ""}
+      endUserFirstName: ${a_active_chat_res.response.body[0].endUserFirstName ?? ""}
+      endUserLastName: ${a_active_chat_res.response.body[0].endUserLastName ?? ""}
+      status: "ENDED"
+      created: ${a_active_chat_res.response.body[0].created ?? new Date().toISOString()}
+      ended: ${new Date().toISOString()}
+      feedbackRating: ${a_active_chat_res.response.body[0].feedbackRating ?? ""}
+      feedbackText: ${a_active_chat_res.response.body[0].feedbackText ?? ""}
+      endUserEmail: ${a_active_chat_res.response.body[0].endUserEmail ?? ""}
+      endUserPhone: ${a_active_chat_res.response.body[0].endUserPhone ?? ""}
+      endUserOs: ${a_active_chat_res.response.body[0].endUserOs ?? ""}
+      endUserUrl: ${a_active_chat_res.response.body[0].endUserUrl ?? ""}
+      externalId: ${a_active_chat_res.response.body[0].externalId ?? ""}
+      forwardedTo: ${a_active_chat_res.response.body[0].forwardedTo ?? ""}
+      forwardedToName: ${a_active_chat_res.response.body[0].forwardedToName ?? ""}
+      receivedFrom: ${a_active_chat_res.response.body[0].receivedFrom ?? ""}
+      receivedFromName: ${a_active_chat_res.response.body[0].receivedFromName ?? ""}
+  error: return_ok
+  result: a_end_chat_res
+
+a_notify_end:
+  template: "[#CHATBOT_PROJECT_LAYER]/chats/notify"
+  requestType: templates
+  body:
+    chatId: ${chatId}
+  result: a_end_notify_res
+  next: return_ok
+
+# ---------------------------------------------------------------- demo.sh test
+forward_to_test_receiver:
+  call: http.post
+  args:
+    url: "${(cfg.testReceiverUrl ?? '') + '/network-test'}"
+    body:
+      id: ${dmrId}
+      senderId: ${senderId}
+      event: ${event}
+      org: ${meta.org ?? ''}
+      inReplyTo: ${meta.inReplyTo ?? ''}
+      active: ${String(meta.active ?? '')}
+      reason: ${meta.reason ?? ''}
+      answered: ${String(meta.answered ?? '')}
+      handoverUrl: ${meta.handoverUrl ?? ''}
+      content: ${msg.content ?? ''}
+  timeout: 5000
+  error: return_ignored
+  result: test_receiver_res
+  next: return_ok
+
+return_ok:
+  status: 200
+  return: "OK"
+  next: end
+
+return_ignored:
+  status: 200
+  return: "Ignored"
+  next: end
+
+return_reply_failed:
+  status: 200
+  return: "Reply to DMR agent failed"
+  next: end
