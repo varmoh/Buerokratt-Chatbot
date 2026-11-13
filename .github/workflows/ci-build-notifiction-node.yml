@@ -4,8 +4,11 @@ on:
   push:
     branches:
       - v3.3.3
+      - notifications-log
     paths:
       - '.env.node'
+      - 'notification-server/**'
+      - '.github/workflows/ci-build-notifiction-node.yml'
 
 jobs:
   PackageDeploy:

@@ -1,5 +1,9 @@
 const { v4: uuidv4 } = require('uuid');
 
+const { createLogger, cleanId } = require('./logger');
+
+const log = createLogger('stream-queue');
+
 class StreamQueue {
   constructor() {
     this.queue = new Map();
@@ -20,6 +24,13 @@ class StreamQueue {
     };
 
     this.queue.get(channelId).push(requestWithMetadata);
+    log.info('Stream request queued', {
+      channelId: cleanId(channelId),
+      requestId: requestWithMetadata.id,
+      source: requestData.source || (requestData.message === undefined ? 'azure' : 'widget-llm'),
+      channelQueueLength: this.queue.get(channelId).length,
+      queuedChannels: this.queue.size,
+    });
     return requestWithMetadata.id;
   }
 
@@ -44,6 +55,8 @@ class StreamQueue {
   }
 
   clearChannelQueue(channelId) {
+    const count = this.queue.get(channelId)?.length || 0;
+    if (count > 0) log.info('Channel stream queue cleared', { channelId: cleanId(channelId), dropped: count });
     return this.queue.delete(channelId);
   }
 
@@ -60,6 +73,12 @@ class StreamQueue {
     if (request) {
       request.retryCount++;
       request.lastRetry = Date.now();
+      log.warn('Stream request retry count increased', {
+        channelId: cleanId(channelId),
+        requestId,
+        retryCount: request.retryCount,
+        maxRetries: this.maxRetries,
+      });
       return true;
     }
     return false;

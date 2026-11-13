@@ -1,5 +1,9 @@
 const { getAccessToken } = require('./azureAgenticAuth');
 const { azureAgenticConfig } = require('./config');
+const { loggedFetch } = require('./httpLogging');
+const { createLogger, preview } = require('./logger');
+
+const log = createLogger('azure-agentic');
 
 function handleSSELines(lines, yieldFn) {
   for (const line of lines) {
@@ -9,7 +13,7 @@ function handleSSELines(lines, yieldFn) {
         const parsed = JSON.parse(data);
         yieldFn(parsed);
       } catch (e) {
-        console.error('Error parsing SSE data:', e);
+        log.warn('Error parsing agentic SSE data', { line: preview(line), error: e });
       }
     }
   }
@@ -41,7 +45,7 @@ async function* parseSSEStream(response) {
         const parsed = JSON.parse(buffer.slice(6));
         yield parsed;
       } catch (e) {
-        console.error('Error parsing final SSE data:', e);
+        log.warn('Error parsing final agentic SSE data', { line: preview(buffer), error: e });
       }
     }
   } finally {
@@ -88,7 +92,14 @@ async function sendAzureAgenticRequest(messages, options = {}) {
       body: JSON.stringify(requestBody),
     };
 
-    const response = await fetch(requestUrl, fetchOptions);
+    log.info('Agentic request', {
+      agent_name,
+      agent_type,
+      stream,
+      inputMessages: requestBody.input.length,
+      max_output_tokens: requestBody.max_output_tokens,
+    });
+    const response = await loggedFetch('azure-agentic', requestUrl, fetchOptions, { logResponseBody: false });
 
     if (!response.ok) {
       const errorData = await response.text();
@@ -102,7 +113,7 @@ async function sendAzureAgenticRequest(messages, options = {}) {
     const jsonData = await response.json();
     return jsonData;
   } catch (error) {
-    console.error('Azure Agentic API error:', error);
+    log.error('Azure Agentic API error', { agent_name, error });
     throw error;
   }
 }

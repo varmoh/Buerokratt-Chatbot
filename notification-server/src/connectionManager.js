@@ -1,3 +1,7 @@
+const { createLogger } = require('./logger');
+
+const log = createLogger('connections');
+
 const activeConnections = new Map();
 const stoppedChannels = new Set();
 
@@ -34,12 +38,15 @@ function unregisterAbortController(connectionId, controller) {
 function abortConnectionRequests(connectionId) {
   const connData = activeConnections.get(connectionId);
   if (!connData?.abortControllers) return;
+  if (connData.abortControllers.size > 0) {
+    log.info('Aborting in-flight upstream requests', { connectionId, count: connData.abortControllers.size });
+  }
 
   for (const controller of connData.abortControllers) {
     try {
       controller.abort();
     } catch (error) {
-      console.error(`Failed to abort upstream request for ${connectionId}:`, error);
+      log.error('Failed to abort upstream request', { connectionId, error });
     }
   }
   connData.abortControllers.clear();

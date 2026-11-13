@@ -1,5 +1,9 @@
 const { AzureOpenAI } = require('openai');
 
+const { createLogger, maskUrl } = require('./logger');
+
+const log = createLogger('azure-openai');
+
 const azureConfig = {
   endpoint: process.env.AZURE_OPENAI_ENDPOINT,
   apiKey: process.env.AZURE_OPENAI_API_KEY,
@@ -22,6 +26,12 @@ function initializeAzureOpenAI() {
     apiVersion: azureConfig.apiVersion,
   });
 
+  log.info('Azure OpenAI client created', {
+    endpoint: maskUrl(azureConfig.endpoint),
+    deployment: azureConfig.deployment,
+    apiVersion: azureConfig.apiVersion,
+    model: azureConfig.modelName,
+  });
   return client;
 }
 
@@ -41,13 +51,25 @@ async function streamAzureOpenAIResponse(messages, options = {}) {
       data_sources,
     };
 
+    log.info('⇢ chat.completions.create', {
+      model: azureConfig.modelName,
+      deployment: azureConfig.deployment,
+      stream,
+      max_tokens,
+      temperature,
+      top_p,
+      messageCount: messages?.length,
+      dataSources: data_sources?.map((d) => d?.type),
+    });
+    log.debug('chat.completions.create request', { requestConfig });
+
     if (stream) {
       return client.chat.completions.create(requestConfig);
     } else {
       return await client.chat.completions.create(requestConfig);
     }
   } catch (error) {
-    console.error('Azure OpenAI API error:', error);
+    log.error('Azure OpenAI API error', { error });
     throw error;
   }
 }

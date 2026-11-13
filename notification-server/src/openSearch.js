@@ -13,7 +13,12 @@ const {
 } = require('./citationFormatting');
 const { openSearchConfig } = require('./config');
 const { activeConnections, stoppedChannels } = require('./connectionManager');
+const { loggedFetch, elapsedMs } = require('./httpLogging');
+const { createLogger, cleanId, maskUrl, preview } = require('./logger');
 const streamQueue = require('./streamQueue');
+
+const log = createLogger('opensearch');
+const llmLog = createLogger('llm');
 
 let client = buildClient();
 
@@ -221,15 +226,37 @@ async function searchNotification({ channelId, connectionId, sender }) {
       })
       .catch(handleError);
 
-    for (const hit of response.body.hits.hits) {
+    const hits = response.body.hits.hits;
+    log.trace('notification poll', { channelId: cleanId(channelId), connectionId, hits: hits.length });
+    if (hits.length > 0) {
+      log.info('Notifications found for channel', {
+        channelId: cleanId(channelId),
+        connectionId,
+        count: hits.length,
+        tookMs: response.body.took,
+      });
+    }
+
+    for (const hit of hits) {
       const notification = hit._source;
+      const createdMs = Number(notification.timestamp);
+
+      log.info('Delivering notification', {
+        channelId: cleanId(channelId),
+        connectionId,
+        notificationId: hit._id,
+        createdAt: notification.timestamp,
+        ageMs: Number.isFinite(createdMs) ? Date.now() - createdMs : undefined,
+        alreadySentTo: notification.sentTo?.length || 0,
+        payload: notification.payload,
+      });
 
       await sender(notification.payload);
 
       await markAsSent(hit, connectionId);
     }
   } catch (e) {
-    console.error('processing notification error:', e);
+    log.error('Processing notification failed', { channelId: cleanId(channelId), connectionId, error: e });
     await sender({ error: 'Notification processing failed' });
   }
 }
@@ -247,6 +274,7 @@ async function createAzureOpenAIStreamRequest({
   raw_response = false,
 }) {
   const { stream = true } = options;
+  const logChannelId = cleanId(channelId);
 
   try {
     stoppedChannels.delete(channelId);
@@ -254,6 +282,14 @@ async function createAzureOpenAIStreamRequest({
     const connections = Array.from(activeConnections.entries()).filter(
       ([_, connData]) => connData.channelId === channelId,
     );
+
+    llmLog.info('Azure request starting', {
+      channelId: logChannelId,
+      provider: use_agentic ? 'azure-agentic' : 'azure-openai',
+      stream,
+      connections: connections.length,
+    });
+    llmLog.debug('Azure request messages', { channelId: logChannelId, messages });
 
     if (connections.length === 0) {
       const requestId = streamQueue.addToQueue(channelId, {
@@ -267,11 +303,16 @@ async function createAzureOpenAIStreamRequest({
         azure_agentic_max_output_tokens,
         raw_response,
       });
-      console.log('No active connections for channel, queued request');
+      llmLog.warn('No active SSE connection for channel - Azure request queued', {
+        channelId: logChannelId,
+        requestId,
+        queueLength: streamQueue.getPendingRequests(channelId).length,
+      });
     }
 
     const responsePromises = connections.map(async ([connectionId, connData]) => {
       const { sender } = connData;
+      const started = process.hrtime.bigint();
 
       try {
         const response = await fetchLLMResponse({
@@ -286,7 +327,16 @@ async function createAzureOpenAIStreamRequest({
           azure_agentic_max_output_tokens,
         });
 
+        llmLog.info('Azure response received', {
+          channelId: logChannelId,
+          connectionId,
+          stream,
+          durationMs: elapsedMs(started),
+          ...(stream ? {} : summarizeAzureResponse(response, use_agentic)),
+        });
+
         if (!activeConnections.has(connectionId)) {
+          llmLog.info('SSE client left before the Azure answer could be delivered', { connectionId });
           return;
         }
 
@@ -314,6 +364,12 @@ async function createAzureOpenAIStreamRequest({
           estonianFallback,
         });
       } catch (error) {
+        llmLog.error('Azure request failed for connection', {
+          channelId: logChannelId,
+          connectionId,
+          durationMs: elapsedMs(started),
+          error,
+        });
         if (activeConnections.has(connectionId)) {
           const errorMessage = `Failed to ${stream ? 'stream' : 'generate'} response: ${error.message}`;
           sender({
@@ -336,16 +392,60 @@ async function createAzureOpenAIStreamRequest({
       message: `Azure OpenAI ${stream ? 'streaming' : 'response'} completed for all connections`,
     };
   } catch (error) {
-    console.error(`Error in createAzureOpenAIStreamRequest (stream=${stream}):`, error);
+    llmLog.error('createAzureOpenAIStreamRequest failed', { channelId: logChannelId, stream, error });
     throw error;
   }
 }
 
+function summarizeAzureResponse(response, use_agentic) {
+  try {
+    if (use_agentic) {
+      return {
+        responseId: response?.id,
+        status: response?.status,
+        usage: response?.usage,
+        answer: preview(extractMessageTextPart(response)?.text),
+      };
+    }
+    const choice = response?.choices?.[0];
+    return {
+      responseId: response?.id,
+      model: response?.model,
+      finishReason: choice?.finish_reason,
+      usage: response?.usage,
+      answer: preview(choice?.message?.content),
+    };
+  } catch {
+    return {};
+  }
+}
+
 async function sendBulkNotification({ operations }) {
-  await client.bulk({ body: operations });
+  const ops = Array.isArray(operations) ? operations : [];
+  const docs = ops.filter((op) => !op?.index && !op?.create && !op?.update && !op?.delete);
+  log.info('Bulk notification write', {
+    operations: ops.length,
+    documents: docs.length,
+    channels: [...new Set(docs.map((d) => d?.channelId).filter(Boolean))],
+  });
+  log.debug('Bulk notification documents', { documents: docs });
+
+  const response = await client.bulk({ body: operations });
+  const body = response?.body || {};
+
+  if (body.errors) {
+    const failed = (body.items || [])
+      .map((item) => Object.values(item)[0])
+      .filter((item) => item?.error)
+      .map((item) => ({ index: item._index, id: item._id, status: item.status, error: item.error }));
+    log.error('Bulk notification write had errors', { failed: failed.length, items: failed });
+  } else {
+    log.info('Bulk notification write ok', { items: body.items?.length, tookMs: body.took });
+  }
 }
 
 async function markAsSent({ _index, _id }, connectionId) {
+  log.debug('Marking notification as sent', { notificationId: _id, connectionId });
   await client.update({
     index: _index,
     id: _id,
@@ -365,8 +465,12 @@ async function markAsSent({ _index, _id }, connectionId) {
 }
 
 async function enqueueChatId(chatId) {
-  if (await findChatId(chatId)) return;
+  if (await findChatId(chatId)) {
+    log.info('Chat already in queue - not enqueued again', { chatId });
+    return;
+  }
 
+  log.info('Enqueuing chat', { chatId });
   await client
     .index({
       index: openSearchConfig.chatQueueIndex,
@@ -380,7 +484,7 @@ async function enqueueChatId(chatId) {
 }
 
 async function dequeueChatId(chatId) {
-  await client
+  const response = await client
     .deleteByQuery({
       index: openSearchConfig.chatQueueIndex,
       body: {
@@ -396,6 +500,7 @@ async function dequeueChatId(chatId) {
       conflicts: 'proceed',
     })
     .catch(handleError);
+  log.info('Dequeued chat', { chatId, deleted: response?.body?.deleted });
 }
 
 async function findChatId(chatId) {
@@ -462,7 +567,11 @@ function buildClient() {
 }
 
 function handleError(e) {
-  if (e.name === 'ConnectionError') client = buildClient();
+  log.error('OpenSearch call failed', { url: maskUrl(openSearchConfig.getUrl()), error: e });
+  if (e.name === 'ConnectionError') {
+    log.warn('OpenSearch connection error - rebuilding client');
+    client = buildClient();
+  }
   throw e;
 }
 
@@ -471,11 +580,21 @@ async function createLLMOrchestrationStreamRequest({ channelId, chatId, message,
     ([_, connData]) => connData.channelId === channelId,
   );
 
-  console.log('Active connections for LLM stream channel:', connections.length);
+  const logChannelId = cleanId(channelId);
+  llmLog.info('Widget LLM orchestration request', {
+    channelId: logChannelId,
+    chatId,
+    connections: connections.length,
+  });
 
   if (connections.length === 0) {
-    streamQueue.addToQueue(channelId, { chatId: chatId || channelId, message, authorId, conversationHistory });
-    console.log('No active connections for channel, queued LLM request');
+    const requestId = streamQueue.addToQueue(channelId, {
+      chatId: chatId || channelId,
+      message,
+      authorId,
+      conversationHistory,
+    });
+    llmLog.warn('No active SSE connection for channel - LLM request queued', { channelId: logChannelId, requestId });
     return;
   }
 
@@ -509,6 +628,7 @@ function buildConversationHistory(conversationHistory) {
 
 function processSSELine(line, sender, channelId) {
   if (!line.trim() || !line.startsWith('data: ')) return false;
+  llmLog.trace('upstream frame', { channelId: cleanId(channelId), line: preview(line) });
   try {
     const data = JSON.parse(line.slice(6));
     const content = data.payload?.content;
@@ -519,7 +639,11 @@ function processSSELine(line, sender, channelId) {
     }
     sender({ type: 'stream_chunk', content, streamId: channelId, channelId, isComplete: false });
   } catch (parseError) {
-    console.error('Failed to parse LLM SSE data:', parseError, line);
+    llmLog.warn('Failed to parse LLM SSE data', {
+      channelId: cleanId(channelId),
+      line: preview(line),
+      error: parseError,
+    });
   }
   return false;
 }
@@ -541,7 +665,8 @@ async function readLLMStream(reader, decoder, sender, channelId, connectionId) {
 async function handleLLMConnection(connectionId, connData, orchestrationPayload, channelId) {
   const { sender } = connData;
   try {
-    const response = await fetch(
+    const response = await loggedFetch(
+      'llm-orchestrator',
       `${process.env.LLM_ORCHESTRATOR_URL || 'http://llm-orchestration-service:8100'}/orchestrate/stream`,
       {
         method: 'POST',
@@ -556,7 +681,7 @@ async function handleLLMConnection(connectionId, connData, orchestrationPayload,
     sender({ type: 'stream_start', streamId: channelId, channelId, isComplete: false });
     await readLLMStream(response.body.getReader(), new TextDecoder(), sender, channelId, connectionId);
   } catch (error) {
-    console.error(`LLM streaming error for connection ${connectionId}:`, error);
+    llmLog.error('Widget LLM streaming error', { channelId: cleanId(channelId), connectionId, error });
     if (activeConnections.has(connectionId)) {
       sender({ type: 'stream_error', error: error.message, streamId: channelId, channelId, isComplete: true });
     }

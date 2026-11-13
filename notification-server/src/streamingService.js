@@ -1,5 +1,9 @@
 const { activeConnections, registerAbortController, unregisterAbortController } = require('./connectionManager');
+const { loggedFetch, elapsedMs } = require('./httpLogging');
+const { createLogger, cleanId, preview } = require('./logger');
 const streamQueue = require('./streamQueue');
+
+const log = createLogger('llm-gui');
 
 // Inactivity budget for the upstream SSE body. This is an idle timeout, not a
 // total-duration cap: the timer resets on every byte received, so a long answer
@@ -22,6 +26,8 @@ const LLM_GUI_QUEUE_SOURCE = 'llm-gui';
 function relaySSELine({ line, channelId, sender }) {
   if (!line.trim()) return false;
   if (!line.startsWith('data: ')) return false; // ignores `: ping` heartbeats
+
+  log.trace('upstream frame', { channelId: cleanId(channelId), line: preview(line) });
 
   try {
     const data = JSON.parse(line.slice(6)); // Remove 'data: ' prefix
@@ -54,7 +60,11 @@ function relaySSELine({ line, channelId, sender }) {
     sender(chunkMessage);
     return false;
   } catch (parseError) {
-    console.error(`Failed to parse SSE data for channel ${channelId}:`, parseError, line);
+    log.warn('Failed to parse upstream SSE data', {
+      channelId: cleanId(channelId),
+      line: preview(line),
+      error: parseError,
+    });
     return false;
   }
 }
@@ -64,7 +74,7 @@ function relaySSELine({ line, channelId, sender }) {
  * Returns once the stream ends, the client disconnects, or END is received.
  * @returns {Promise<boolean>} true if an END frame terminated the stream
  */
-async function relayUpstreamBody({ response, connectionId, channelId, sender, onActivity }) {
+async function relayUpstreamBody({ response, connectionId, channelId, sender, onActivity, stats }) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -74,6 +84,8 @@ async function relayUpstreamBody({ response, connectionId, channelId, sender, on
     if (done) break;
 
     onActivity();
+    stats.bytes += value?.length || 0;
+    stats.firstByteMs ??= elapsedMs(stats.start);
 
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
@@ -101,12 +113,19 @@ async function createLLMOrchestrationStreamRequest({ channelId, message, options
     ([_, connData]) => connData.channelId === channelId,
   );
 
-  // Strip line breaks so the request value cannot inject fake log lines
-  const logChannelId = channelId.replace(/[\n\r]/g, '');
-  console.log(`Active connections for channel ${logChannelId}:`, connections.length);
+  const logChannelId = cleanId(channelId);
+  log.info('LLM GUI orchestration request', {
+    channelId: logChannelId,
+    connections: connections.length,
+    message: preview(message),
+    authorId: options.authorId,
+    environment: options.environment,
+    historyLength: options.conversationHistory?.length || 0,
+  });
 
   if (connections.length === 0) {
-    streamQueue.addToQueue(channelId, { message, options, source: LLM_GUI_QUEUE_SOURCE });
+    const requestId = streamQueue.addToQueue(channelId, { message, options, source: LLM_GUI_QUEUE_SOURCE });
+    log.warn('No active SSE connection for channel - LLM GUI request queued', { channelId: logChannelId, requestId });
 
     if (streamQueue.shouldRetry({ retryCount: 0 })) {
       throw new Error('No active connections found for this channel - request queued');
@@ -114,8 +133,6 @@ async function createLLMOrchestrationStreamRequest({ channelId, message, options
       throw new Error('No active connections found for this channel');
     }
   }
-
-  console.log(`Streaming LLM orchestration for channel ${logChannelId} to ${connections.length} connections`);
 
   try {
     const responsePromises = connections.map(([connectionId, connData]) =>
@@ -125,7 +142,7 @@ async function createLLMOrchestrationStreamRequest({ channelId, message, options
     await Promise.all(responsePromises);
     return { success: true, message: 'Stream completed' };
   } catch (error) {
-    console.error(`Error in createLLMOrchestrationStreamRequest:`, error);
+    log.error('createLLMOrchestrationStreamRequest failed', { channelId: logChannelId, error });
     throw error;
   }
 }
@@ -138,6 +155,8 @@ async function streamToConnection({ connectionId, connData, channelId, message, 
   const abortController = new AbortController();
   let idleTimer = null;
   let idleTimedOut = false;
+  const logChannelId = cleanId(channelId);
+  const stats = { start: process.hrtime.bigint(), bytes: 0, firstByteMs: undefined };
 
   // Idle watchdog: reset on every chunk received. Only fires when the upstream
   // genuinely stops producing, never on a merely long answer.
@@ -145,7 +164,11 @@ async function streamToConnection({ connectionId, connData, channelId, message, 
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       idleTimedOut = true;
-      console.error(`Upstream idle for ${UPSTREAM_IDLE_TIMEOUT_MS}ms on channel ${channelId} - aborting`);
+      log.error('Upstream idle - aborting', {
+        channelId: logChannelId,
+        connectionId,
+        idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
+      });
       abortController.abort();
     }, UPSTREAM_IDLE_TIMEOUT_MS);
   };
@@ -162,7 +185,7 @@ async function streamToConnection({ connectionId, connData, channelId, message, 
       connection_id: options.connection_id,
     };
 
-    console.log(`Calling LLM orchestration stream for channel ${channelId}`);
+    log.debug('Orchestration payload', { channelId: logChannelId, connectionId, payload: orchestrationPayload });
 
     // The controller serves two purposes: cancelling the upstream request when
     // the browser disconnects, and enforcing the idle timeout above.
@@ -170,7 +193,7 @@ async function streamToConnection({ connectionId, connData, channelId, message, 
     resetIdleTimer();
 
     // Call the LLM orchestration streaming endpoint
-    const response = await fetch(`${ORCHESTRATOR_URL}/orchestrate/stream`, {
+    const response = await loggedFetch('llm-orchestrator', `${ORCHESTRATOR_URL}/orchestrate/stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -184,6 +207,7 @@ async function streamToConnection({ connectionId, connData, channelId, message, 
     }
 
     if (!activeConnections.has(connectionId)) {
+      log.info('SSE client left before upstream answered', { channelId: logChannelId, connectionId });
       return;
     }
 
@@ -201,6 +225,17 @@ async function streamToConnection({ connectionId, connData, channelId, message, 
       channelId,
       sender,
       onActivity: resetIdleTimer,
+      stats,
+    });
+
+    log.info('Upstream stream finished', {
+      channelId: logChannelId,
+      connectionId,
+      sawEnd,
+      clientStillConnected: activeConnections.has(connectionId),
+      upstreamBytes: stats.bytes,
+      timeToFirstByteMs: stats.firstByteMs,
+      durationMs: elapsedMs(stats.start),
     });
 
     // The body closed without an END frame. The browser has a stream_start and
@@ -209,7 +244,7 @@ async function streamToConnection({ connectionId, connData, channelId, message, 
     // path to remember the marker. A client that has already disconnected needs
     // no notification.
     if (!sawEnd && activeConnections.has(connectionId)) {
-      console.error(`Upstream body ended without END marker on channel ${channelId} (connection ${connectionId})`);
+      log.error('Upstream body ended without END marker', { channelId: logChannelId, connectionId });
       sender({
         type: 'stream_error',
         error: 'The response ended unexpectedly. Please try again.',
@@ -222,19 +257,25 @@ async function streamToConnection({ connectionId, connData, channelId, message, 
     // A client-disconnect abort is expected teardown, not a failure: the browser
     // is gone, there is nobody to notify and nothing to log loudly.
     if (error.name === 'AbortError' && !idleTimedOut) {
-      console.log(`Upstream stream cancelled for connection ${connectionId} (client disconnected)`);
+      log.info('Upstream stream cancelled (client disconnected)', {
+        channelId: logChannelId,
+        connectionId,
+        durationMs: elapsedMs(stats.start),
+      });
       return;
     }
 
     if (idleTimedOut) {
       // The AbortError here is our own watchdog firing; its stack says nothing
       // useful, so report the actual cause instead.
-      console.error(
-        `Streaming timed out for connection ${connectionId}: no upstream output ` +
-          `for ${UPSTREAM_IDLE_TIMEOUT_MS}ms on channel ${channelId}`,
-      );
+      log.error('Streaming timed out: no upstream output', {
+        channelId: logChannelId,
+        connectionId,
+        idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
+        upstreamBytes: stats.bytes,
+      });
     } else {
-      console.error(`Streaming error for connection ${connectionId}:`, error);
+      log.error('Streaming error', { channelId: logChannelId, connectionId, upstreamBytes: stats.bytes, error });
     }
 
     if (activeConnections.has(connectionId)) {
